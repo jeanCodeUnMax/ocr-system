@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Secure OCR Lab — Studio d'Ingestion, d'Audit et de Revue RAG</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #0a0d14;
+      --bg-surface: #111726;
+      --bg-card: #161f33;
+      --bg-hover: #1e2a45;
+      --border-subtle: #23314f;
+      --border-focus: #3b82f6;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent-blue: #3b82f6;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-rose: #ef4444;
+      --accent-indigo: #6366f1;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --shadow-glow: 0 0 25px rgba(59, 130, 246, 0.15);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      line-height: 1.5;
+    }
+
+    /* Top Navigation Bar */
+    header {
+      background-color: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 0.85rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-weight: 700;
+      font-size: 1.2rem;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-icon {
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-indigo));
+      color: white;
+      width: 36px;
+      height: 36px;
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+    }
+
+    .status-badges {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.3rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+    }
+
+    .badge-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--accent-emerald);
+      box-shadow: 0 0 8px var(--accent-emerald);
+    }
+
+    /* Tabs Navigation */
+    .tabs-bar {
+      background-color: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 0 2rem;
+      display: flex;
+      gap: 1.5rem;
+    }
+
+    .tab-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 0.9rem;
+      padding: 0.9rem 0.2rem;
+      cursor: pointer;
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: color 0.2s ease;
+    }
+
+    .tab-btn:hover {
+      color: var(--text-primary);
+    }
+
+    .tab-btn.active {
+      color: var(--accent-blue);
+    }
+
+    .tab-btn.active::after {
+      content: '';
+      position: absolute;
+      bottom: -1px;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background-color: var(--accent-blue);
+      border-radius: 2px;
+    }
+
+    /* Main Content Container */
+    main {
+      flex: 1;
+      max-width: 1400px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+
+    .view-section {
+      display: none;
+      animation: fadeIn 0.25s ease forwards;
+    }
+
+    .view-section.active {
+      display: block;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Ingestion Form & Dropzone */
+    .grid-ingest {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+    }
+
+    .card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.75rem;
+      box-shadow: var(--shadow-glow);
+    }
+
+    .card-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--text-primary);
+    }
+
+    .dropzone {
+      border: 2px dashed var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 3rem 1.5rem;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      background: rgba(17, 23, 38, 0.4);
+    }
+
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--accent-blue);
+      background: rgba(59, 130, 246, 0.05);
+    }
+
+    .dropzone-icon {
+      font-size: 2.5rem;
+      margin-bottom: 0.75rem;
+      color: var(--accent-blue);
+    }
+
+    .file-chosen-name {
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: var(--accent-emerald);
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    textarea.input-text {
+      width: 100%;
+      height: 180px;
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      color: var(--text-primary);
+      padding: 1rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      resize: vertical;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    textarea.input-text:focus {
+      border-color: var(--border-focus);
+    }
+
+    .form-group {
+      margin-bottom: 1.25rem;
+    }
+
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 0.5rem;
+    }
+
+    select, input[type="number"] {
+      width: 100%;
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      padding: 0.65rem 0.85rem;
+      font-size: 0.9rem;
+      outline: none;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-blue), #2563eb);
+      color: white;
+      border: none;
+      border-radius: var(--radius-md);
+      padding: 0.85rem 1.5rem;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      width: 100%;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(59, 130, 246, 0.45);
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* Review & Visualizer Split View */
+    .review-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr;
+      gap: 2rem;
+      min-height: 700px;
+    }
+
+    .page-viewer-container {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .canvas-wrapper {
+      position: relative;
+      max-width: 100%;
+      max-height: 750px;
+      overflow: auto;
+      border-radius: var(--radius-md);
+      background: #000;
+    }
+
+    .canvas-wrapper img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+    }
+
+    .bbox-overlay-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .bbox-interactive {
+      position: absolute;
+      border: 2px solid rgba(59, 130, 246, 0.8);
+      background: rgba(59, 130, 246, 0.12);
+      cursor: pointer;
+      pointer-events: auto;
+      transition: all 0.15s ease;
+      border-radius: 3px;
+    }
+
+    .bbox-interactive:hover, .bbox-interactive.selected {
+      border-color: var(--accent-amber);
+      background: rgba(245, 158, 11, 0.25);
+      z-index: 10;
+    }
+
+    .bbox-interactive.flagged {
+      border-color: var(--accent-rose);
+      background: rgba(239, 68, 68, 0.2);
+    }
+
+    /* Right Review Deck */
+    .review-deck {
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      max-height: 800px;
+      overflow-y: auto;
+      padding-right: 0.5rem;
+    }
+
+    .block-card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      transition: border-color 0.2s;
+    }
+
+    .block-card.selected {
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 15px rgba(59, 130, 246, 0.2);
+    }
+
+    .block-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
+    }
+
+    .block-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    .block-text {
+      font-size: 0.95rem;
+      color: var(--text-primary);
+      margin-bottom: 1rem;
+      background: rgba(10, 13, 20, 0.5);
+      padding: 0.75rem;
+      border-radius: var(--radius-sm);
+      border-left: 3px solid var(--accent-blue);
+      white-space: pre-wrap;
+    }
+
+    .decision-buttons {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.5rem;
+    }
+
+    .btn-decision {
+      padding: 0.5rem 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-surface);
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      text-align: center;
+    }
+
+    .btn-decision:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
+
+    .btn-decision.active-accepted {
+      background: rgba(16, 185, 129, 0.15);
+      border-color: var(--accent-emerald);
+      color: var(--accent-emerald);
+    }
+
+    .btn-decision.active-noise {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: var(--accent-rose);
+      color: var(--accent-rose);
+    }
+
+    .btn-decision.active-quarantine {
+      background: rgba(245, 158, 11, 0.15);
+      border-color: var(--accent-amber);
+      color: var(--accent-amber);
+    }
+
+    .btn-decision.active-needs_reocr {
+      background: rgba(99, 102, 241, 0.15);
+      border-color: var(--accent-indigo);
+      color: var(--accent-indigo);
+    }
+
+    /* Audit & Proof Table */
+    .proof-box {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .hash-line {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: var(--accent-emerald);
+      background: #080c14;
+      padding: 0.6rem 0.85rem;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-subtle);
+      margin-top: 0.4rem;
+      word-break: break-all;
+    }
+
+    /* RAG Export View */
+    .export-options {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .btn-export {
+      padding: 0.75rem 1.25rem;
+      border-radius: var(--radius-md);
+      font-weight: 600;
+      font-size: 0.85rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-primary);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: all 0.2s;
+    }
+
+    .btn-export:hover {
+      border-color: var(--accent-blue);
+      background: var(--bg-hover);
+    }
+
+    pre.code-preview {
+      background-color: #070a10;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+      color: #38bdf8;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      max-height: 500px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+
+    /* Spinner */
+    .spinner {
+      border: 2px solid rgba(255, 255, 255, 0.2);
+      border-top: 2px solid white;
+      border-radius: 50%;
+      width: 18px;
+      height: 18px;
+      animation: spin 0.6s linear infinite;
+      display: inline-block;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-icon">🛡️</div>
+      <span>Secure OCR Lab</span>
+    </div>
+    <div class="status-badges">
+      <div class="badge">
+        <div class="badge-dot" id="server-status-dot"></div>
+        <span id="server-status-text">Connecté (8765)</span>
+      </div>
+      <div class="badge">
+        <span>OCR :</span>
+        <strong id="badge-ocr-lang" style="color: var(--text-primary);">eng</strong>
+      </div>
+      <div class="badge">
+        <span>Preuve :</span>
+        <strong style="color: var(--accent-emerald);">SHA-256 Strict</strong>
+      </div>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="tabs-bar">
+    <button class="tab-btn active" onclick="switchTab('ingest-view', this)">📥 1. Ingestion & Analyse</button>
+    <button class="tab-btn" onclick="switchTab('review-view', this)">🔍 2. Visualiseur & Revue Humaine</button>
+    <button class="tab-btn" onclick="switchTab('audit-view', this)">📜 3. Manifeste d'Audit</button>
+    <button class="tab-btn" onclick="switchTab('export-view', this)">📦 4. Export RAG</button>
+  </nav>
+
+  <!-- Main Container -->
+  <main>
+
+    <!-- 1. Ingestion View -->
+    <section id="ingest-view" class="view-section active">
+      <div class="grid-ingest">
+        <!-- File Upload Card -->
+        <div class="card">
+          <h2 class="card-title">📄 Document Source (PDF / Image)</h2>
+          <div class="dropzone" id="file-dropzone" onclick="document.getElementById('file-input').click()">
+            <div class="dropzone-icon">📤</div>
+            <p style="font-weight: 600; margin-bottom: 0.35rem;">Glissez-déposez votre fichier ici</p>
+            <p style="font-size: 0.85rem; color: var(--text-muted);">Supporte PDF, PNG, JPG, TIFF (Conversion image-first)</p>
+            <div class="file-chosen-name" id="file-chosen-name"></div>
+          </div>
+          <input type="file" id="file-input" style="display: none;" accept=".pdf,.png,.jpg,.jpeg,.webp,.tiff" onchange="handleFileSelected(this)">
+        </div>
+
+        <!-- Raw Text or Configuration Card -->
+        <div class="card">
+          <h2 class="card-title">✍️ Ou Coller du Texte Brut</h2>
+          <textarea id="raw-text-input" class="input-text" placeholder="Collez un texte technique, prompt ou document ici pour générer une page virtuelle et des blocs auditables..."></textarea>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+            <div class="form-group">
+              <label for="select-lang">Langue OCR (Tesseract)</label>
+              <select id="select-lang">
+                <option value="eng">English (eng)</option>
+                <option value="fra">Français (fra)</option>
+                <option value="fra+eng" selected>Français + English</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="select-dpi">Résolution Rasterisation (DPI)</label>
+              <select id="select-dpi">
+                <option value="150">150 DPI (Rapide)</option>
+                <option value="200" selected>200 DPI (Recommandé)</option>
+                <option value="300">300 DPI (Haute précision)</option>
+              </select>
+            </div>
+          </div>
+
+          <button id="btn-submit-analyze" class="btn-primary" onclick="submitAnalysis()">
+            <span id="btn-spinner" style="display: none;" class="spinner"></span>
+            <span id="btn-text">Lancer l'Analyse Image-First & OCR</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. Visualizer & Human Review View -->
+    <section id="review-view" class="view-section">
+      <div id="no-run-alert" style="text-align: center; padding: 4rem 2rem; color: var(--text-muted);">
+        <p style="font-size: 2.5rem; margin-bottom: 1rem;">📂</p>
+        <p style="font-size: 1.1rem; font-weight: 600;">Aucun document analysé pour l'instant.</p>
+        <p style="font-size: 0.9rem; margin-top: 0.4rem;">Passez par l'onglet <strong>1. Ingestion</strong> pour lancer un premier traitement.</p>
+      </div>
+
+      <div id="review-content" class="review-grid" style="display: none;">
+        <!-- Left: Interactive Document Canvas -->
+        <div class="page-viewer-container">
+          <div style="display: flex; justify-content: space-between; width: 100%; margin-bottom: 0.85rem; align-items: center;">
+            <span style="font-weight: 600; font-size: 0.9rem; color: var(--text-secondary);">Page rasterisée & Boîtes BBox</span>
+            <span id="current-run-badge" class="badge" style="color: var(--accent-blue);">run_id: -</span>
+          </div>
+
+          <div class="canvas-wrapper" id="canvas-wrapper">
+            <img id="page-image-display" src="" alt="Page image">
+            <div id="bbox-overlay" class="bbox-overlay-layer"></div>
+          </div>
+        </div>
+
+        <!-- Right: Review Action Deck -->
+        <div class="review-deck" id="blocks-review-list">
+          <!-- Dynamic block cards rendered here -->
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. Audit Manifest View -->
+    <section id="audit-view" class="view-section">
+      <div class="proof-box">
+        <h2 class="card-title">🛡️ Arbre de Preuve Cryptographique (Audit Lineage)</h2>
+        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 1.25rem;">
+          Chaque bloc et chaque chunk RAG est relié de manière immuable à la page rasterisée et au document d'origine.
+        </p>
+
+        <div style="margin-bottom: 1rem;">
+          <label>1. Empreinte Source SHA-256 :</label>
+          <div class="hash-line" id="audit-source-sha256">-</div>
+        </div>
+
+        <div style="margin-bottom: 1rem;">
+          <label>2. Empreinte Image Rasterisée Page 1 SHA-256 :</label>
+          <div class="hash-line" id="audit-page-sha256">-</div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1.5rem;">
+          <div class="card" style="padding: 1rem;">
+            <span style="font-size: 0.8rem; color: var(--text-muted);">Pages traitées</span>
+            <h3 id="audit-stat-pages" style="font-size: 1.5rem; color: var(--text-primary);">-</h3>
+          </div>
+          <div class="card" style="padding: 1rem;">
+            <span style="font-size: 0.8rem; color: var(--text-muted);">Blocs détectés</span>
+            <h3 id="audit-stat-blocks" style="font-size: 1.5rem; color: var(--accent-blue);">-</h3>
+          </div>
+          <div class="card" style="padding: 1rem;">
+            <span style="font-size: 0.8rem; color: var(--text-muted);">Chunks sémantiques</span>
+            <h3 id="audit-stat-chunks" style="font-size: 1.5rem; color: var(--accent-emerald);">-</h3>
+          </div>
+        </div>
+      </div>
+
+      <div class="proof-box">
+        <h2 class="card-title">🔍 Couche Shadow (Comparaison Texte Natif vs Texte Visible)</h2>
+        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 1rem;">
+          Permet d'intercepter les prompts cachés, les textes en blanc sur fond blanc ou le code injecté dans les métadonnées PDF sans jamais les indexer.
+        </p>
+        <div id="shadow-layer-report" style="font-size: 0.9rem; color: var(--text-muted);">
+          Aucune anomalie de dissimulation détectée.
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Export RAG View -->
+    <section id="export-view" class="view-section">
+      <div class="card">
+        <h2 class="card-title">📦 Export RAG Auditable (JSONL)</h2>
+        <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 1.25rem;">
+          Téléchargez ou inspectez les enregistrements prêts pour votre base vectorielle avec métadonnées de boîte englobante et chaîne de hachage.
+        </p>
+
+        <div class="export-options">
+          <button class="btn-export" onclick="loadRagExport('raw')">📄 Export Brut (Tous les Chunks)</button>
+          <button class="btn-export" onclick="loadRagExport('reviewed')">🛡️ Export Filtré (Revue Humaine Approuvée)</button>
+          <button class="btn-export" onclick="loadRagExport('accepted')">✅ Strictement Accepté</button>
+        </div>
+
+        <pre id="rag-records-preview" class="code-preview">// Les enregistrements JSONL apparaîtront ici après analyse...</pre>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    let currentAnalysis = null;
+    let selectedFile = null;
+    let decisionsMap = {};
+
+    // Initialisation
+    document.addEventListener("DOMContentLoaded", async () => {
+      await fetchConfig();
+      setupDropzone();
+    });
+
+    async function fetchConfig() {
+      try {
+        const res = await fetch("/api/config");
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById("badge-ocr-lang").textContent = data.ocr_lang || "eng";
+          document.getElementById("select-lang").value = data.ocr_lang || "eng";
+        }
+      } catch (err) {
+        document.getElementById("server-status-text").textContent = "Hors ligne";
+        document.getElementById("server-status-dot").style.backgroundColor = "var(--accent-rose)";
+      }
+    }
+
+    function switchTab(viewId, btn) {
+      document.querySelectorAll(".view-section").forEach(el => el.classList.remove("active"));
+      document.querySelectorAll(".tab-btn").forEach(el => el.classList.remove("active"));
+      document.getElementById(viewId).classList.add("active");
+      btn.classList.add("active");
+    }
+
+    function setupDropzone() {
+      const dropzone = document.getElementById("file-dropzone");
+      ['dragenter', 'dragover'].forEach(name => {
+        dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+      });
+      ['dragleave', 'drop'].forEach(name => {
+        dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); });
+      });
+      dropzone.addEventListener('drop', (e) => {
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+          selectedFile = files[0];
+          document.getElementById("file-chosen-name").textContent = `Fichier sélectionné : ${selectedFile.name} (${Math.round(selectedFile.size / 1024)} KB)`;
+        }
+      });
+    }
+
+    function handleFileSelected(input) {
+      if (input.files.length > 0) {
+        selectedFile = input.files[0];
+        document.getElementById("file-chosen-name").textContent = `Fichier sélectionné : ${selectedFile.name} (${Math.round(selectedFile.size / 1024)} KB)`;
+      }
+    }
+
+    async function submitAnalysis() {
+      const textInput = document.getElementById("raw-text-input").value.trim();
+      if (!selectedFile && !textInput) {
+        alert("Veuillez sélectionner un fichier ou saisir un texte.");
+        return;
+      }
+
+      const btn = document.getElementById("btn-submit-analyze");
+      const spinner = document.getElementById("btn-spinner");
+      const btnText = document.getElementById("btn-text");
+
+      btn.disabled = true;
+      spinner.style.display = "inline-block";
+      btnText.textContent = "Analyse Image-First en cours...";
+
+      const formData = new FormData();
+      if (selectedFile) {
+        formData.append("file", selectedFile);
+      }
+      if (textInput) {
+        formData.append("text", textInput);
+      }
+
+      try {
+        const response = await fetch("/api/analyze", {
+          method: "POST",
+          body: formData,
+        });
+        const data = await response.json();
+        if (!response.ok || !data.run_id) {
+          throw new Error(data.error || "Erreur durant l'analyse");
+        }
+        currentAnalysis = data;
+        renderAnalysisResult(data);
+        // Bascule automatique sur la vue de revue
+        const reviewTabBtn = document.querySelectorAll(".tab-btn")[1];
+        switchTab("review-view", reviewTabBtn);
+      } catch (err) {
+        alert("Erreur lors de l'analyse : " + err.message);
+      } finally {
+        btn.disabled = false;
+        spinner.style.display = "none";
+        btnText.textContent = "Lancer l'Analyse Image-First & OCR";
+      }
+    }
+
+    function renderAnalysisResult(data) {
+      document.getElementById("no-run-alert").style.display = "none";
+      document.getElementById("review-content").style.display = "grid";
+      document.getElementById("current-run-badge").textContent = `Run: ${data.run_id}`;
+
+      // Rendu de l'image de la première page
+      if (data.pages && data.pages.length > 0) {
+        const page1 = data.pages[0];
+        const pageImg = document.getElementById("page-image-display");
+        pageImg.src = page1.image_url;
+
+        pageImg.onload = () => {
+          renderBboxes(page1.blocks, page1.width, page1.height, pageImg);
+        };
+
+        renderBlocksList(page1.blocks, data.run_id);
+      }
+
+      // Rendu de la vue Audit
+      document.getElementById("audit-source-sha256").textContent = data.source_sha256;
+      if (data.pages && data.pages[0]) {
+        document.getElementById("audit-page-sha256").textContent = data.pages[0].page_image_sha256;
+      }
+      document.getElementById("audit-stat-pages").textContent = data.page_count;
+      document.getElementById("audit-stat-blocks").textContent = (data.pages[0]?.blocks || []).length;
+      document.getElementById("audit-stat-chunks").textContent = (data.chunks || []).length;
+
+      // Aperçu RAG
+      document.getElementById("rag-records-preview").textContent = (data.rag_records || [])
+        .map(r => JSON.stringify(r, null, 2))
+        .join("\n\n");
+    }
+
+    function renderBboxes(blocks, origW, origH, imgElement) {
+      const overlay = document.getElementById("bbox-overlay");
+      overlay.innerHTML = "";
+
+      const scaleX = imgElement.clientWidth / origW;
+      const scaleY = imgElement.clientHeight / origH;
+
+      blocks.forEach(block => {
+        const [x0, y0, x1, y1] = block.bbox;
+        const box = document.createElement("div");
+        box.className = "bbox-interactive" + (block.security_flags?.length ? " flagged" : "");
+        box.id = `bbox-${block.block_id}`;
+        box.style.left = `${x0 * scaleX}px`;
+        box.style.top = `${y0 * scaleY}px`;
+        box.style.width = `${(x1 - x0) * scaleX}px`;
+        box.style.height = `${(y1 - y0) * scaleY}px`;
+
+        box.onclick = () => selectBlock(block.block_id);
+        overlay.appendChild(box);
+      });
+    }
+
+    function renderBlocksList(blocks, runId) {
+      const container = document.getElementById("blocks-review-list");
+      container.innerHTML = "";
+
+      blocks.forEach(block => {
+        const card = document.createElement("div");
+        card.className = "block-card";
+        card.id = `card-${block.block_id}`;
+
+        const isFlagged = block.security_flags && block.security_flags.length > 0;
+        const flagsHtml = isFlagged
+          ? `<span style="color: var(--accent-rose); font-size: 0.75rem; font-weight: 600;">⚠️ ${block.security_flags.join(', ')}</span>`
+          : `<span style="color: var(--text-muted); font-size: 0.75rem;">Confiance: ${Math.round((block.confidence || 0) * 100)}%</span>`;
+
+        card.innerHTML = `
+          <div class="block-header">
+            <span class="block-title">${block.block_id} [${block.grid_cell}]</span>
+            ${flagsHtml}
+          </div>
+          <div class="block-text">${escapeHtml(block.text)}</div>
+          <div class="decision-buttons">
+            <button class="btn-decision" onclick="setDecision('${runId}', 'block', '${block.block_id}', 'accepted', this)">✅ Valider</button>
+            <button class="btn-decision" onclick="setDecision('${runId}', 'block', '${block.block_id}', 'noise', this)">🗑️ Bruit</button>
+            <button class="btn-decision" onclick="setDecision('${runId}', 'block', '${block.block_id}', 'quarantine', this)">☣️ Quarantaine</button>
+            <button class="btn-decision" onclick="setDecision('${runId}', 'block', '${block.block_id}', 'needs_reocr', this)">🔄 Ré-OCR</button>
+          </div>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function selectBlock(blockId) {
+      document.querySelectorAll(".block-card").forEach(c => c.classList.remove("selected"));
+      document.querySelectorAll(".bbox-interactive").forEach(b => b.classList.remove("selected"));
+
+      const targetCard = document.getElementById(`card-${blockId}`);
+      const targetBbox = document.getElementById(`bbox-${blockId}`);
+
+      if (targetCard) {
+        targetCard.classList.add("selected");
+        targetCard.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+      if (targetBbox) {
+        targetBbox.classList.add("selected");
+      }
+    }
+
+    async function setDecision(runId, targetKind, targetId, decision, btn) {
+      try {
+        const res = await fetch("/api/review", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            run_id: runId,
+            target_kind: targetKind,
+            target_id: targetId,
+            decision: decision,
+            note: "Validé depuis le studio web"
+          })
+        });
+        if (res.ok) {
+          const parent = btn.parentElement;
+          parent.querySelectorAll(".btn-decision").forEach(b => {
+            b.className = "btn-decision";
+          });
+          btn.classList.add(`active-${decision}`);
+        }
+      } catch (err) {
+        alert("Impossible de sauvegarder la décision : " + err.message);
+      }
+    }
+
+    async function loadRagExport(policy) {
+      if (!currentAnalysis) {
+        alert("Veuillez d'abord exécuter une analyse.");
+        return;
+      }
+      try {
+        const res = await fetch(`/api/rag-export?run_id=${currentAnalysis.run_id}&policy=${policy}`);
+        const text = await res.text();
+        document.getElementById("rag-records-preview").textContent = text || "// Aucun enregistrement ne correspond à cette politique de filtre.";
+      } catch (err) {
+        alert("Erreur lors de l'export : " + err.message);
+      }
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>

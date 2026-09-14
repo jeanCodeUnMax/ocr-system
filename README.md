@@ -17,14 +17,31 @@ Back-office local pour tester une boucle OCR auditable, securisee et orientee RA
 
 ## Lancer
 
+### Windows (PowerShell) :
+
+```powershell
+# Création et activation de l'environnement virtuel (recommandé)
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# Lancement de l'application
+py app.py
+```
+
+### Linux / macOS :
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 python3 app.py
 ```
 
-Puis ouvrir:
+Puis ouvrir dans votre navigateur :
 
 ```text
-http://127.0.0.1:8765
+http://127.0.0.1:8788
 ```
 
 ## Versions implementees

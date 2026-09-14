@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent
 RUNS = ROOT / "runs"
 STATIC = ROOT / "static"
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("PORT", "8765"))
+PORT = int(os.environ.get("PORT", "8788"))
 
 
 def parse_multipart(body: bytes, content_type: str) -> dict[str, tuple[str, bytes] | str]:
