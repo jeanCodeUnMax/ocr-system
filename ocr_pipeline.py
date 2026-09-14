@@ -1,634 +1,927 @@
 from __future__ import annotations
 
 import csv
+import difflib
 import hashlib
-import io
 import json
-import math
 import os
 import re
 import shutil
 import subprocess
 import time
-import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from textwrap import wrap
 
-# Import conditionnel de Pillow et PyMuPDF
-try:
-    from PIL import Image, ImageDraw, ImageFont
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
-try:
-    import pymupdf as fitz
-    HAS_FITZ = True
-except ImportError:
-    try:
-        import fitz
-        HAS_FITZ = True
-    except ImportError:
-        HAS_FITZ = False
+import fitz
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
-SUSPICIOUS_PATTERNS = [
-    re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.IGNORECASE),
-    re.compile(r"system\s*prompt", re.IGNORECASE),
-    re.compile(r"you\s+are\s+now\s+in\s+developer\s+mode", re.IGNORECASE),
-    re.compile(r"<\s*script[^>]*>", re.IGNORECASE),
-    re.compile(r"base64\s*,\s*[A-Za-z0-9+/=]{40,}", re.IGNORECASE),
-    re.compile(r"eval\s*\(", re.IGNORECASE),
+OCR_LANG_REQUESTED = os.environ.get("OCR_LANG", "eng")
+OCR_LANG = OCR_LANG_REQUESTED
+DPI = int(os.environ.get("OCR_DPI", "220"))
+MAX_CHUNK_WORDS = int(os.environ.get("MAX_CHUNK_WORDS", "500"))
+MIN_CHUNK_WORDS = int(os.environ.get("MIN_CHUNK_WORDS", "120"))
+PIPELINE_VERSION = "0.5.1"
+SCHEMA_VERSION = "secure-ocr-lab.analysis.v2"
+OCR_PREPROCESS_MODE = os.environ.get("OCR_PREPROCESS_MODE", "auto")
+BINARY_THRESHOLD = int(os.environ.get("OCR_BINARY_THRESHOLD", "180"))
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s*instructions?",
+    r"system\s+prompt",
+    r"developer\s+mode",
+    r"reveal\s+(the\s+)?prompt",
+    r"bypass\s+(safety|rules|guardrails)",
+    r"base64",
+    r"api[_\s-]?key",
 ]
 
 
-def sha256_bytes(data: bytes) -> str:
-    """Calcule le hash SHA-256 d'une chaîne binaire."""
-    return hashlib.sha256(data).hexdigest()
-
-
-def sha256_text(text: str) -> str:
-    """Calcule le hash SHA-256 d'un texte encodé en UTF-8."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+@dataclass
+class OcrLine:
+    text: str
+    bbox: tuple[int, int, int, int]
+    confidence: float
 
 
 def make_run_id() -> str:
-    """Génère un identifiant d'exécution unique et horodaté."""
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    rand_suffix = uuid.uuid4().hex[:6]
-    return f"run_{timestamp}_{rand_suffix}"
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
 
-def find_tesseract_binary() -> str | None:
-    """Détecte l'exécutable Tesseract CLI dans le PATH ou dans les dossiers Windows standards."""
-    found = shutil.which("tesseract")
-    if found:
-        return found
-    candidate_paths = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"D:\Program Files\Tesseract-OCR\tesseract.exe",
-        os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
-    ]
-    for candidate in candidate_paths:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def detect_grid_cell(bbox: list[int], width: int, height: int, rows: int = 4, cols: int = 4) -> str:
-    """Calcule la cellule de grille (ex: R1C1) correspondant au centre de la boîte englobante."""
-    if width <= 0 or height <= 0:
-        return "R1C1"
-    center_x = (bbox[0] + bbox[2]) / 2.0
-    center_y = (bbox[1] + bbox[3]) / 2.0
-    col_idx = min(cols, max(1, int(math.floor((center_x / width) * cols)) + 1))
-    row_idx = min(rows, max(1, int(math.floor((center_y / height) * rows)) + 1))
-    return f"R{row_idx}C{col_idx}"
+def hash_payload(payload: dict) -> str:
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def detect_security_flags(text: str, native_text_diff: bool = False) -> list[str]:
-    """Détecte les anomalies de sécurité (prompt injection, dissimulation, mismatch shadow layer)."""
-    flags = []
-    if native_text_diff:
-        flags.append("shadow_mismatch")
-    for pattern in SUSPICIOUS_PATTERNS:
-        if pattern.search(text):
-            flags.append("prompt_injection_suspect")
-            break
-    # Détection de texte à haute entropie ou chaînes obfusquées
-    words = text.split()
-    if any(len(w) > 45 and not w.startswith("http") for w in words):
-        flags.append("obfuscated_token")
-    return flags
+def analyze_document(source: Path, run_dir: Path) -> dict:
+    source_hash = sha256_file(source)
+    native_pages = extract_native_text_layers(source)
+    images = rasterize_source(source, run_dir)
+    return analyze_images(images, source.name, run_dir, source_hash, native_pages)
 
 
-def detect_quality_flags(confidence: float | None, text: str) -> list[str]:
-    """Évalue la qualité optique d'un bloc de texte OCR."""
-    flags = []
-    if confidence is not None and confidence < 0.60:
-        flags.append("low_confidence")
-    if text.strip() and sum(1 for c in text if not c.isalnum() and not c.isspace()) / len(text) > 0.40:
-        flags.append("noisy_characters")
-    return flags
+def analyze_plain_text(text: str, run_dir: Path) -> dict:
+    source = run_dir / "pasted_text.txt"
+    source.write_text(text, encoding="utf-8")
+    image = render_text_to_image(text, run_dir / "page-001.png")
+    return analyze_images([image], source.name, run_dir, sha256_file(source), [text])
 
 
-def run_tesseract_tsv(image_path: Path, lang: str, dpi: int) -> list[dict]:
-    """Exécute Tesseract CLI pour extraire les blocs de texte avec coordonnées précises (TSV)."""
-    tess_bin = find_tesseract_binary()
-    if not tess_bin:
-        return []
-
-    cmd = [tess_bin, str(image_path), "stdout", "-l", lang, "--dpi", str(dpi), "tsv"]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=60)
-        tsv_output = proc.stdout.decode("utf-8", "replace")
-    except Exception:
-        return []
-
-    blocks_dict: dict[int, dict] = {}
-    reader = csv.DictReader(io.StringIO(tsv_output), delimiter="\t")
-    for row in reader:
-        text = (row.get("text") or "").strip()
-        conf_raw = row.get("conf", "-1")
+def extract_native_text_layers(source: Path) -> list[str]:
+    suffix = source.suffix.lower()
+    if suffix == ".pdf":
         try:
-            conf = float(conf_raw) / 100.0
-        except ValueError:
-            conf = -1.0
-        if not text or conf < 0:
-            continue
-
-        try:
-            left = int(row.get("left", 0))
-            top = int(row.get("top", 0))
-            width = int(row.get("width", 0))
-            height = int(row.get("height", 0))
-            block_num = int(row.get("block_num", 1))
-        except (ValueError, TypeError):
-            continue
-
-        bbox = [left, top, left + width, top + height]
-        if block_num not in blocks_dict:
-            blocks_dict[block_num] = {
-                "words": [text],
-                "bbox": bbox,
-                "confs": [conf],
-            }
-        else:
-            entry = blocks_dict[block_num]
-            entry["words"].append(text)
-            entry["confs"].append(conf)
-            # Agrandir la bbox pour englober tous les mots du bloc
-            entry["bbox"] = [
-                min(entry["bbox"][0], bbox[0]),
-                min(entry["bbox"][1], bbox[1]),
-                max(entry["bbox"][2], bbox[2]),
-                max(entry["bbox"][3], bbox[3]),
-            ]
-
-    result_blocks = []
-    for b_num, entry in sorted(blocks_dict.items()):
-        text_joined = " ".join(entry["words"]).strip()
-        if not text_joined:
-            continue
-        avg_conf = sum(entry["confs"]) / len(entry["confs"]) if entry["confs"] else 0.8
-        result_blocks.append({
-            "block_index": b_num,
-            "text": text_joined,
-            "bbox": entry["bbox"],
-            "confidence": round(avg_conf, 3),
-        })
-    return result_blocks
+            doc = fitz.open(source)
+            return [page.get_text("text") for page in doc]
+        except Exception:
+            return []
+    if suffix in {".txt", ".md", ".csv", ".json", ".html", ".htm"}:
+        return [source.read_text(encoding="utf-8", errors="replace")]
+    return []
 
 
-def draw_bounding_boxes(image_path: Path, output_overlay_path: Path, blocks: list[dict]) -> None:
-    """Dessine les boîtes englobantes (bbox) sur une copie de l'image de la page pour le contrôle visuel."""
-    if not HAS_PIL or not image_path.exists():
-        return
-    try:
-        with Image.open(image_path) as img:
-            overlay = img.convert("RGBA")
-            draw = ImageDraw.Draw(overlay)
+def rasterize_source(source: Path, run_dir: Path) -> list[Path]:
+    suffix = source.suffix.lower()
+    if suffix == ".pdf":
+        return rasterize_pdf(source, run_dir)
+    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+        return [normalize_image(source, run_dir / "page-001.png")]
+    if suffix in {".txt", ".md", ".csv", ".json", ".html", ".htm"}:
+        return [render_text_to_image(source.read_text(encoding="utf-8", errors="replace"), run_dir / "page-001.png")]
+    raise ValueError(f"Format non supporte pour la V1: {suffix or source.name}")
+
+
+def rasterize_pdf(source: Path, run_dir: Path) -> list[Path]:
+    doc = fitz.open(source)
+    zoom = DPI / 72
+    matrix = fitz.Matrix(zoom, zoom)
+    images = []
+    for index, page in enumerate(doc, start=1):
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        out = run_dir / f"page-{index:03d}.png"
+        pix.save(out)
+        images.append(out)
+    return images
+
+
+def normalize_image(source: Path, target: Path) -> Path:
+    img = Image.open(source).convert("RGB")
+    white = Image.new("RGB", img.size, "white")
+    white.paste(img)
+    white.save(target)
+    return target
+
+
+def render_text_to_image(text: str, target: Path) -> Path:
+    font = load_font(26)
+    lines: list[str] = []
+    for paragraph in text.splitlines() or [text]:
+        wrapped = wrap(paragraph, width=78) or [""]
+        lines.extend(wrapped + [""])
+    width = 1400
+    line_height = 38
+    height = max(240, 80 + line_height * len(lines))
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    y = 40
+    for line in lines:
+        draw.text((40, y), line, fill=(20, 24, 32), font=font)
+        y += line_height
+    img.save(target)
+    return target
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ):
+        if Path(path).exists():
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def analyze_images(
+    images: list[Path], source_name: str, run_dir: Path, source_hash: str, native_pages: list[str] | None = None
+) -> dict:
+    native_pages = native_pages or []
+    pages = []
+    all_chunks = []
+    for page_num, image_path in enumerate(images, start=1):
+        page_id = f"p{page_num:03d}"
+        page_hash = sha256_file(image_path)
+        ocr_image_path, preprocessing = prepare_image_for_ocr(image_path, run_dir / f"page-{page_num:03d}-ocr.png")
+        lines, ocr_report = run_tesseract(ocr_image_path)
+        blocks = group_lines_into_blocks(lines, page_id, page_hash, source_hash)
+        page_text = "\n".join(block["text"] for block in blocks)
+        native_text = native_pages[page_num - 1] if page_num - 1 < len(native_pages) else ""
+        layer_comparison = compare_text_layers(page_text, native_text)
+        if layer_comparison["needs_human_review"]:
             for block in blocks:
-                bbox = block.get("bbox", [0, 0, 0, 0])
-                flags = block.get("security_flags", [])
-                color = (239, 68, 68, 220) if flags else (59, 130, 246, 200)
-                fill_color = (239, 68, 68, 40) if flags else (59, 130, 246, 25)
-                draw.rectangle(bbox, outline=color, fill=fill_color, width=2)
-            # Sauvegarde en PNG
-            overlay.convert("RGB").save(output_overlay_path, "PNG")
-    except Exception:
-        pass
-
-
-def chunk_blocks(blocks: list[dict], page_num: int, target_words: int = 150) -> list[dict]:
-    """Regroupe les blocs d'une page en chunks sémantiques cohérents avec calcul de preuve SHA-256."""
-    chunks = []
-    current_blocks: list[dict] = []
-    current_words = 0
-    chunk_index = 1
-
-    def flush_chunk():
-        nonlocal chunk_index, current_blocks, current_words
-        if not current_blocks:
-            return
-        chunk_text = "\n\n".join(b["text"] for b in current_blocks).strip()
-        block_ids = [b["block_id"] for b in current_blocks]
-        block_hashes = [b["block_sha256"] for b in current_blocks]
-
-        # Calcul de la bbox englobante
-        min_x = min(b["bbox"][0] for b in current_blocks)
-        min_y = min(b["bbox"][1] for b in current_blocks)
-        max_x = max(b["bbox"][2] for b in current_blocks)
-        max_y = max(b["bbox"][3] for b in current_blocks)
-        chunk_bbox = [min_x, min_y, max_x, max_y]
-
-        # Empreintes cryptographiques
-        text_hash = sha256_text(chunk_text)
-        chunk_lineage = f"{text_hash}:" + ",".join(block_hashes)
-        chunk_hash = sha256_text(chunk_lineage)
-
-        # Agrégation des drapeaux de sécurité
-        all_sec_flags = []
-        for b in current_blocks:
-            for f in b.get("security_flags", []):
-                if f not in all_sec_flags:
-                    all_sec_flags.append(f)
-
-        chunk_id = f"c_p{page_num}_{chunk_index}"
-        chunks.append({
-            "chunk_id": chunk_id,
-            "page": page_num,
-            "bbox": chunk_bbox,
-            "chunk_sha256": chunk_hash,
-            "text_sha256": text_hash,
-            "block_ids": block_ids,
-            "block_hashes": block_hashes,
-            "security_flags": all_sec_flags,
-            "word_count": len(chunk_text.split()),
-            "text": chunk_text,
-        })
-        chunk_index += 1
-        current_blocks = []
-        current_words = 0
-
-    for block in blocks:
-        words_in_block = len(block["text"].split())
-        if current_words + words_in_block > target_words and current_blocks:
-            flush_chunk()
-        current_blocks.append(block)
-        current_words += words_in_block
-
-    flush_chunk()
-    return chunks
-
-
-def analyze_document(source_path: Path, run_dir: Path) -> dict[str, Any]:
-    """Pipeline d'analyse documentaire image-first avec auditabilité complète et shadow layer."""
-    run_id = run_dir.name
-    source_bytes = source_path.read_bytes()
-    source_sha256 = sha256_bytes(source_bytes)
-    ocr_lang = os.environ.get("OCR_LANG", "eng")
-    dpi = int(os.environ.get("OCR_DPI", "200"))
-
-    pages: list[dict] = []
-    all_chunks: list[dict] = []
-    rag_records: list[dict] = []
-
-    ext = source_path.suffix.lower()
-
-    if ext == ".pdf" and HAS_FITZ:
-        doc = fitz.open(source_path)
-        page_count = len(doc)
-
-        for page_idx in range(page_count):
-            page_num = page_idx + 1
-            doc_page = doc[page_idx]
-
-            # 1. Rasterisation Image-First
-            pix = doc_page.get_pixmap(dpi=dpi)
-            page_image_name = f"page_{page_num}.png"
-            page_image_path = run_dir / page_image_name
-            pix.save(page_image_path)
-            image_bytes = page_image_path.read_bytes()
-            page_image_sha256 = sha256_bytes(image_bytes)
-            width, height = pix.width, pix.height
-
-            # 2. Extraction du texte natif (Couche Shadow)
-            native_text = doc_page.get_text() or ""
-            native_text_cleaned = re.sub(r"\s+", " ", native_text).strip()
-
-            # 3. Extraction OCR sur l'image rasterisée
-            tess_blocks = run_tesseract_tsv(page_image_path, lang=ocr_lang, dpi=dpi)
-
-            page_blocks = []
-            if tess_blocks:
-                # Utilisation des résultats Tesseract CLI
-                for idx, t_block in enumerate(tess_blocks):
-                    block_id = f"b_p{page_num}_{idx + 1}"
-                    text = t_block["text"]
-                    bbox = t_block["bbox"]
-                    conf = t_block["confidence"]
-                    grid = detect_grid_cell(bbox, width, height)
-                    sec_flags = detect_security_flags(text)
-                    qual_flags = detect_quality_flags(conf, text)
-                    page_blocks.append({
-                        "block_id": block_id,
-                        "kind": "heading" if len(text.split()) < 8 and idx == 0 else "text",
-                        "bbox": bbox,
-                        "grid_cell": grid,
-                        "confidence": conf,
-                        "block_sha256": sha256_text(text),
-                        "security_flags": sec_flags,
-                        "quality_flags": qual_flags,
-                        "text": text,
-                    })
-            else:
-                # Fallback haute fidélité via PyMuPDF (mise à l'échelle DPI)
-                scale = dpi / 72.0
-                raw_blocks = doc_page.get_text("blocks")
-                for idx, b in enumerate(raw_blocks):
-                    text = (b[4] or "").strip()
-                    if not text:
-                        continue
-                    block_id = f"b_p{page_num}_{idx + 1}"
-                    bbox = [int(b[0] * scale), int(b[1] * scale), int(b[2] * scale), int(b[3] * scale)]
-                    grid = detect_grid_cell(bbox, width, height)
-                    sec_flags = detect_security_flags(text)
-                    qual_flags = detect_quality_flags(0.95, text)
-                    page_blocks.append({
-                        "block_id": block_id,
-                        "kind": "text",
-                        "bbox": bbox,
-                        "grid_cell": grid,
-                        "confidence": 0.95,
-                        "block_sha256": sha256_text(text),
-                        "security_flags": sec_flags,
-                        "quality_flags": qual_flags,
-                        "text": text,
-                    })
-
-            # 4. Détection des divergences Couche Shadow vs OCR Visible
-            visible_text_page = " ".join(b["text"] for b in page_blocks)
-            if native_text_cleaned and len(native_text_cleaned) > len(visible_text_page) * 1.5:
-                # Texte invisible ou caché présent dans le PDF natif
-                for b in page_blocks:
-                    if "shadow_mismatch" not in b["security_flags"]:
-                        b["security_flags"].append("shadow_mismatch")
-
-            # 5. Génération de l'image de superposition avec Bounding Boxes
-            overlay_name = f"page_{page_num}_overlay.png"
-            overlay_path = run_dir / overlay_name
-            draw_bounding_boxes(page_image_path, overlay_path, page_blocks)
-
-            # 6. Découpage en chunks pour la page
-            page_chunks = chunk_blocks(page_blocks, page_num)
-            all_chunks.extend(page_chunks)
-
-            pages.append({
+                if "native_ocr_divergence" not in block["quality_flags"]:
+                    block["quality_flags"].append("native_ocr_divergence")
+        chunks = make_chunks(blocks, page_num, source_name, source_hash, page_hash)
+        overlay_path = draw_overlay(image_path, blocks, run_dir / f"overlay-{page_num:03d}.png")
+        for chunk in chunks:
+            all_chunks.append(chunk)
+        width, height = Image.open(image_path).size
+        pages.append(
+            {
                 "page": page_num,
-                "page_image_sha256": page_image_sha256,
+                "page_id": page_id,
+                "image_url": f"/runs/{run_dir.name}/{image_path.name}",
+                "ocr_image_url": f"/runs/{run_dir.name}/{ocr_image_path.name}",
+                "overlay_url": f"/runs/{run_dir.name}/{overlay_path.name}",
+                "page_image_sha256": page_hash,
+                "ocr_image_sha256": sha256_file(ocr_image_path),
                 "width": width,
                 "height": height,
-                "image_url": f"/runs/{run_id}/{page_image_name}",
-                "overlay_url": f"/runs/{run_id}/{overlay_name}" if overlay_path.exists() else None,
-                "blocks": page_blocks,
-                "shadow_layer": {
-                    "native_text_length": len(native_text_cleaned),
-                    "visible_text_length": len(visible_text_page),
-                    "has_shadow_mismatch": any("shadow_mismatch" in b["security_flags"] for b in page_blocks),
+                "preprocessing": preprocessing,
+                "ocr": ocr_report,
+                "line_count": len(lines),
+                "block_count": len(blocks),
+                "layers": {
+                    "visual_ocr": {
+                        "role": "indexable_candidate",
+                        "text_sha256": hashlib.sha256(page_text.encode("utf-8")).hexdigest(),
+                        "char_count": len(page_text),
+                    },
+                    "native_text_shadow": {
+                        "role": "control_only_not_indexed",
+                        "text_sha256": hashlib.sha256(native_text.encode("utf-8")).hexdigest() if native_text else None,
+                        "char_count": len(native_text),
+                    },
+                    "comparison": layer_comparison,
                 },
-            })
+                "blocks": blocks,
+            }
+        )
 
-    else:
-        # Traitement pour Images (PNG, JPG, TIFF, etc.)
-        page_count = 1
-        page_image_path = run_dir / f"page_1.png"
-
-        if HAS_PIL:
-            try:
-                with Image.open(source_path) as img:
-                    img.convert("RGB").save(page_image_path, "PNG")
-                    width, height = img.width, img.height
-            except Exception:
-                page_image_path.write_bytes(source_bytes)
-                width, height = 1200, 1600
-        else:
-            page_image_path.write_bytes(source_bytes)
-            width, height = 1200, 1600
-
-        page_image_sha256 = sha256_bytes(page_image_path.read_bytes())
-        tess_blocks = run_tesseract_tsv(page_image_path, lang=ocr_lang, dpi=dpi)
-
-        page_blocks = []
-        if tess_blocks:
-            for idx, t_block in enumerate(tess_blocks):
-                block_id = f"b_p1_{idx + 1}"
-                text = t_block["text"]
-                bbox = t_block["bbox"]
-                conf = t_block["confidence"]
-                page_blocks.append({
-                    "block_id": block_id,
-                    "kind": "text",
-                    "bbox": bbox,
-                    "grid_cell": detect_grid_cell(bbox, width, height),
-                    "confidence": conf,
-                    "block_sha256": sha256_text(text),
-                    "security_flags": detect_security_flags(text),
-                    "quality_flags": detect_quality_flags(conf, text),
-                    "text": text,
-                })
-        else:
-            # Fallback basique image
-            block_id = "b_p1_1"
-            sample_text = f"[Image rasterisée sans Tesseract CLI - {source_path.name}]"
-            page_blocks.append({
-                "block_id": block_id,
-                "kind": "image_placeholder",
-                "bbox": [50, 50, width - 50, height - 50],
-                "grid_cell": "R1C1",
-                "confidence": 0.50,
-                "block_sha256": sha256_text(sample_text),
-                "security_flags": [],
-                "quality_flags": ["no_tesseract"],
-                "text": sample_text,
-            })
-
-        overlay_path = run_dir / "page_1_overlay.png"
-        draw_bounding_boxes(page_image_path, overlay_path, page_blocks)
-        page_chunks = chunk_blocks(page_blocks, 1)
-        all_chunks.extend(page_chunks)
-
-        pages.append({
-            "page": 1,
-            "page_image_sha256": page_image_sha256,
-            "width": width,
-            "height": height,
-            "image_url": f"/runs/{run_id}/page_1.png",
-            "overlay_url": f"/runs/{run_id}/page_1_overlay.png" if overlay_path.exists() else None,
-            "blocks": page_blocks,
-        })
-
-    # Construction des enregistrements RAG auditables
-    for chunk in all_chunks:
-        needs_review = bool(chunk["security_flags"])
-        rag_records.append({
-            "chunk_id": chunk["chunk_id"],
-            "text": chunk["text"],
-            "index_status": "needs_review" if needs_review else "ready",
-            "metadata": {
-                "run_id": run_id,
-                "source_name": source_path.name,
-                "source_sha256": source_sha256,
-                "page": chunk["page"],
-                "chunk_id": chunk["chunk_id"],
-                "chunk_sha256": chunk["chunk_sha256"],
-                "text_sha256": chunk["text_sha256"],
-                "block_ids": chunk["block_ids"],
-                "block_hashes": chunk.get("block_hashes", []),
-                "bbox": chunk["bbox"],
-                "security_flags": chunk["security_flags"],
-                "word_count": chunk["word_count"],
-            },
-        })
+    repetition_summary = detect_repeated_blocks(pages)
+    review_queue = build_review_queue(pages, all_chunks, repetition_summary)
+    graph = build_graph_projection(pages)
+    rag_records = build_rag_records(all_chunks, pages, source_name, source_hash)
 
     return {
-        "run_id": run_id,
-        "source_name": source_path.name,
-        "source_sha256": source_sha256,
-        "ocr_lang": ocr_lang,
-        "dpi": dpi,
+        "ok": True,
+        "schema_version": SCHEMA_VERSION,
+        "pipeline_version": PIPELINE_VERSION,
+        "run_id": run_dir.name,
+        "source_name": source_name,
+        "source_sha256": source_hash,
+        "ocr_lang": resolve_tesseract_languages()["effective_lang"],
+        "ocr_lang_requested": OCR_LANG_REQUESTED,
+        "dpi": DPI,
+        "ocr_engine": "tesseract_cli",
+        "ocr_diagnostics": tesseract_diagnostics(),
+        "ingestion_manifest": {
+            "schema": "secure-ocr-lab.ingestion.v1",
+            "source_name": source_name,
+            "source_sha256": source_hash,
+            "raster_policy": "image_first_no_native_text_indexing",
+            "native_text_policy": "shadow_control_only_requires_human_approval",
+            "page_hashes": [
+                {
+                    "page": page["page"],
+                    "sha256": page["page_image_sha256"],
+                    "ocr_image_sha256": page["ocr_image_sha256"],
+                }
+                for page in pages
+            ],
+            "chunk_hashes": [{"chunk_id": chunk["chunk_id"], "sha256": chunk["chunk_sha256"]} for chunk in all_chunks],
+        },
+        "quality_report": {
+            "repetition_summary": repetition_summary,
+            "review_queue": review_queue,
+        },
+        "graph": graph,
+        "rag_records": rag_records,
+        "rag_jsonl_url": f"/runs/{run_dir.name}/rag_records.jsonl",
+        "rag_reviewed_jsonl_url": f"/api/rag-export?run_id={run_dir.name}&policy=reviewed",
+        "audit_manifest_url": f"/runs/{run_dir.name}/audit_manifest.json",
         "page_count": len(pages),
         "pages": pages,
         "chunks": all_chunks,
-        "rag_records": rag_records,
+        "json_url": f"/runs/{run_dir.name}/analysis.json",
     }
 
 
-def analyze_plain_text(text: str, run_dir: Path) -> dict[str, Any]:
-    """Analyse un texte brut collé en créant une représentation visuelle et des blocs vérifiables."""
-    run_id = run_dir.name
-    text_clean = text.strip()
-    source_sha256 = sha256_text(text_clean)
-    ocr_lang = os.environ.get("OCR_LANG", "eng")
-    dpi = int(os.environ.get("OCR_DPI", "200"))
+def prepare_image_for_ocr(source: Path, target: Path) -> tuple[Path, dict]:
+    mode = OCR_PREPROCESS_MODE.lower().strip()
+    if mode in {"off", "none", "raw"}:
+        Image.open(source).convert("RGB").save(target)
+        return target, {
+            "mode": "off",
+            "steps": ["rgb_copy"],
+            "bbox_preserved": True,
+            "source_image_sha256": sha256_file(source),
+        }
 
-    width, height = 1200, 1600
-    page_image_path = run_dir / "page_1.png"
+    original = Image.open(source).convert("RGB")
+    prepared = ImageOps.grayscale(original)
+    prepared = ImageOps.autocontrast(prepared)
+    prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
+    prepared = prepared.filter(ImageFilter.UnsharpMask(radius=1.4, percent=155, threshold=3))
+    steps = ["grayscale", "autocontrast", "median_filter_3", "unsharp_mask"]
 
-    # Synthèse d'une page image pour la traçabilité visuelle
-    if HAS_PIL:
-        img = Image.new("RGB", (width, height), color=(255, 255, 255))
-        draw = ImageDraw.Draw(img)
-        lines = text_clean.split("\n")
-        y_cursor = 80
-        for line in lines[:60]:
-            draw.text((60, y_cursor), line[:90], fill=(20, 20, 20))
-            y_cursor += 24
-        img.save(page_image_path, "PNG")
-    else:
-        page_image_path.write_bytes(b"")
+    if mode in {"binary", "threshold"}:
+        prepared = prepared.point(lambda pixel: 255 if pixel >= BINARY_THRESHOLD else 0, mode="1").convert("L")
+        steps.append(f"binary_threshold_{BINARY_THRESHOLD}")
 
-    page_image_sha256 = sha256_bytes(page_image_path.read_bytes())
+    prepared.convert("RGB").save(target)
+    return target, {
+        "mode": mode if mode else "auto",
+        "steps": steps,
+        "bbox_preserved": True,
+        "source_image_sha256": sha256_file(source),
+        "ocr_image_sha256": sha256_file(target),
+        "note": "same pixel dimensions as source page, so OCR bbox can be projected on the displayed page",
+    }
 
-    # Découpage du texte en paragraphes
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text_clean) if p.strip()]
-    if not paragraphs:
-        paragraphs = [text_clean]
 
-    page_blocks = []
-    y_step = max(50, min(140, height // (len(paragraphs) + 1)))
-    current_y = 60
+def run_tesseract(image_path: Path) -> tuple[list[OcrLine], dict]:
+    lang_info = resolve_tesseract_languages()
+    cmd = ["tesseract", str(image_path), "stdout", "-l", lang_info["effective_lang"], "--psm", "6", "tsv"]
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    report = {
+        "engine": "tesseract_cli",
+        "requested_lang": OCR_LANG_REQUESTED,
+        "effective_lang": lang_info["effective_lang"],
+        "missing_langs": lang_info["missing_langs"],
+        "available_langs": lang_info["available_langs"],
+        "command": " ".join(cmd),
+        "returncode": proc.returncode,
+        "stderr": proc.stderr.strip()[:1000],
+    }
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "Erreur Tesseract CLI")
+    rows = csv.DictReader(proc.stdout.splitlines(), delimiter="\t")
+    raw = []
+    for row in rows:
+        text = (row.get("text") or "").strip()
+        conf = parse_conf(row.get("conf"))
+        if not text or conf < 20:
+            continue
+        x, y, w, h = [int(float(row.get(k) or 0)) for k in ("left", "top", "width", "height")]
+        raw.append(OcrLine(text=text, bbox=(x, y, x + w, y + h), confidence=conf))
+    lines = merge_words_into_lines(raw)
+    report["word_count"] = len(raw)
+    report["line_count"] = len(lines)
+    report["status"] = "ok" if lines else "empty_ocr_result"
+    return lines, report
 
-    for idx, para in enumerate(paragraphs):
-        block_id = f"b_p1_{idx + 1}"
-        bbox = [60, current_y, width - 60, current_y + y_step - 10]
-        current_y += y_step
-        sec_flags = detect_security_flags(para)
-        page_blocks.append({
-            "block_id": block_id,
-            "kind": "heading" if idx == 0 and len(para.split()) < 10 else "text",
+
+def tesseract_diagnostics() -> dict:
+    executable = shutil.which("tesseract")
+    if not executable:
+        return {
+            "engine": "tesseract_cli",
+            "available": False,
+            "error": "tesseract executable not found in PATH",
+            "requested_lang": OCR_LANG_REQUESTED,
+        }
+    lang_info = resolve_tesseract_languages()
+    return {
+        "engine": "tesseract_cli",
+        "available": True,
+        "executable": executable,
+        "requested_lang": OCR_LANG_REQUESTED,
+        "effective_lang": lang_info["effective_lang"],
+        "missing_langs": lang_info["missing_langs"],
+        "available_langs": lang_info["available_langs"],
+    }
+
+
+def resolve_tesseract_languages() -> dict:
+    requested = [item for item in re.split(r"[+,]", OCR_LANG_REQUESTED) if item]
+    available = available_tesseract_languages()
+    effective = [lang for lang in requested if lang in available]
+    missing = [lang for lang in requested if lang not in available]
+    if not effective:
+        if "eng" in available:
+            effective = ["eng"]
+        elif available:
+            effective = [available[0]]
+        else:
+            raise RuntimeError("Aucune langue Tesseract disponible.")
+    return {
+        "requested_langs": requested,
+        "available_langs": available,
+        "effective_lang": "+".join(effective),
+        "missing_langs": missing,
+    }
+
+
+def available_tesseract_languages() -> list[str]:
+    if not shutil.which("tesseract"):
+        raise RuntimeError("Tesseract CLI introuvable. Installe tesseract-ocr puis relance le serveur.")
+    proc = subprocess.run(["tesseract", "--list-langs"], text=True, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "Impossible de lister les langues Tesseract.")
+    langs = []
+    for line in proc.stdout.splitlines():
+        value = line.strip()
+        if not value or value.lower().startswith("list of available"):
+            continue
+        langs.append(value)
+    return sorted(langs)
+
+
+def parse_conf(value: str | None) -> float:
+    try:
+        return float(value or -1)
+    except ValueError:
+        return -1
+
+
+def merge_words_into_lines(words: list[OcrLine]) -> list[OcrLine]:
+    if not words:
+        return []
+    words = sorted(words, key=lambda item: (item.bbox[1], item.bbox[0]))
+    lines: list[list[OcrLine]] = []
+    for word in words:
+        cy = (word.bbox[1] + word.bbox[3]) / 2
+        placed = False
+        for line in lines:
+            ly = sum((w.bbox[1] + w.bbox[3]) / 2 for w in line) / len(line)
+            if abs(cy - ly) <= max(10, (word.bbox[3] - word.bbox[1]) * 0.8):
+                line.append(word)
+                placed = True
+                break
+        if not placed:
+            lines.append([word])
+
+    merged = []
+    for line in lines:
+        line.sort(key=lambda item: item.bbox[0])
+        merged.append(
+            OcrLine(
+                text=" ".join(w.text for w in line),
+                bbox=union_bbox([w.bbox for w in line]),
+                confidence=round(sum(w.confidence for w in line) / len(line), 2),
+            )
+        )
+    return sorted(merged, key=lambda item: (item.bbox[1], item.bbox[0]))
+
+
+def group_lines_into_blocks(lines: list[OcrLine], page_id: str, page_hash: str, source_hash: str) -> list[dict]:
+    blocks: list[list[OcrLine]] = []
+    for line in lines:
+        if not blocks:
+            blocks.append([line])
+            continue
+        prev = blocks[-1][-1]
+        vertical_gap = line.bbox[1] - prev.bbox[3]
+        same_column = horizontal_overlap(line.bbox, prev.bbox) > 0.18
+        if vertical_gap <= max(28, (prev.bbox[3] - prev.bbox[1]) * 1.8) and same_column:
+            blocks[-1].append(line)
+        else:
+            blocks.append([line])
+
+    result = []
+    for idx, block_lines in enumerate(blocks, start=1):
+        block_id = f"{page_id}-b{idx:03d}"
+        text = "\n".join(line.text for line in block_lines).strip()
+        bbox = union_bbox([line.bbox for line in block_lines])
+        block_hash = hash_payload(
+            {
+                "source_sha256": source_hash,
+                "page_sha256": page_hash,
+                "block_id": block_id,
+                "bbox": bbox,
+                "text": text,
+            }
+        )
+        result.append(
+            {
+                "block_id": block_id,
+                "kind": classify_block(text),
+                "bbox": bbox,
+                "grid_cell": grid_cell(bbox),
+                "confidence": round(sum(line.confidence for line in block_lines) / len(block_lines), 2),
+                "text": text,
+                "block_sha256": block_hash,
+                "security_flags": security_flags(text),
+                "quality_flags": quality_flags(text, block_lines),
+                "review_status": "pending",
+                "source_ref": {
+                    "source_sha256": source_hash,
+                    "page_id": page_id,
+                    "page_sha256": page_hash,
+                    "bbox": bbox,
+                    "grid_cell": grid_cell(bbox),
+                },
+                "lines": [
+                    {"text": line.text, "bbox": line.bbox, "confidence": line.confidence}
+                    for line in block_lines
+                ],
+            }
+        )
+    return result
+
+
+def make_chunks(blocks: list[dict], page: int, source_name: str, source_hash: str, page_hash: str) -> list[dict]:
+    chunks = []
+    current: list[dict] = []
+    current_words = 0
+    for block in blocks:
+        words = count_words(block["text"])
+        if current and current_words + words > MAX_CHUNK_WORDS:
+            chunks.append(build_chunk(current, page, source_name, source_hash, page_hash, len(chunks) + 1))
+            current = []
+            current_words = 0
+        current.append(block)
+        current_words += words
+        if current_words >= MIN_CHUNK_WORDS and block["text"].rstrip().endswith((".", "!", "?", ":")):
+            chunks.append(build_chunk(current, page, source_name, source_hash, page_hash, len(chunks) + 1))
+            current = []
+            current_words = 0
+    if current:
+        chunks.append(build_chunk(current, page, source_name, source_hash, page_hash, len(chunks) + 1))
+    return chunks
+
+
+def build_chunk(blocks: list[dict], page: int, source_name: str, source_hash: str, page_hash: str, index: int) -> dict:
+    text = "\n\n".join(block["text"] for block in blocks)
+    flags = sorted({flag for block in blocks for flag in block["security_flags"]})
+    bbox = union_bbox([tuple(block["bbox"]) for block in blocks])
+    chunk_id = f"p{page:03d}-c{index:03d}"
+    block_hashes = [block["block_sha256"] for block in blocks]
+    chunk_hash = hash_payload(
+        {
+            "source_sha256": source_hash,
+            "page_sha256": page_hash,
+            "chunk_id": chunk_id,
+            "block_hashes": block_hashes,
             "bbox": bbox,
-            "grid_cell": detect_grid_cell(bbox, width, height),
-            "confidence": 1.0,
-            "block_sha256": sha256_text(para),
-            "security_flags": sec_flags,
-            "quality_flags": [],
-            "text": para,
-        })
-
-    overlay_path = run_dir / "page_1_overlay.png"
-    draw_bounding_boxes(page_image_path, overlay_path, page_blocks)
-
-    chunks = chunk_blocks(page_blocks, 1)
-    rag_records = []
-    for chunk in chunks:
-        rag_records.append({
-            "chunk_id": chunk["chunk_id"],
-            "text": chunk["text"],
-            "index_status": "needs_review" if chunk["security_flags"] else "ready",
-            "metadata": {
-                "run_id": run_id,
-                "source_name": "plain_text_input.txt",
-                "source_sha256": source_sha256,
-                "page": 1,
-                "chunk_id": chunk["chunk_id"],
-                "chunk_sha256": chunk["chunk_sha256"],
-                "text_sha256": chunk["text_sha256"],
-                "block_ids": chunk["block_ids"],
-                "block_hashes": chunk.get("block_hashes", []),
-                "bbox": chunk["bbox"],
-                "security_flags": chunk["security_flags"],
-                "word_count": chunk["word_count"],
-            },
-        })
-
+            "text": text,
+        }
+    )
     return {
-        "run_id": run_id,
-        "source_name": "plain_text_input.txt",
-        "source_sha256": source_sha256,
-        "ocr_lang": ocr_lang,
-        "dpi": dpi,
-        "page_count": 1,
-        "pages": [{
-            "page": 1,
-            "page_image_sha256": page_image_sha256,
-            "width": width,
-            "height": height,
-            "image_url": f"/runs/{run_id}/page_1.png",
-            "overlay_url": f"/runs/{run_id}/page_1_overlay.png" if overlay_path.exists() else None,
-            "blocks": page_blocks,
-        }],
-        "chunks": chunks,
-        "rag_records": rag_records,
+        "chunk_id": chunk_id,
+        "source_name": source_name,
+        "source_sha256": source_hash,
+        "page": page,
+        "page_sha256": page_hash,
+        "block_ids": [block["block_id"] for block in blocks],
+        "block_hashes": block_hashes,
+        "bbox": bbox,
+        "grid_cells": sorted({block["grid_cell"] for block in blocks}),
+        "word_count": count_words(text),
+        "security_flags": flags,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "chunk_sha256": chunk_hash,
+        "source_ref": {
+            "source_sha256": source_hash,
+            "page_id": f"p{page:03d}",
+            "page_sha256": page_hash,
+            "bbox": bbox,
+            "grid_cells": sorted({block["grid_cell"] for block in blocks}),
+            "block_ids": [block["block_id"] for block in blocks],
+            "block_hashes": block_hashes,
+        },
+        "evidence_chain": {
+            "source_sha256": source_hash,
+            "page_sha256": page_hash,
+            "block_hashes": block_hashes,
+            "chunk_sha256": chunk_hash,
+        },
+        "text": text,
     }
 
 
-def build_audit_manifest(result: dict[str, Any]) -> dict[str, Any]:
-    """Construit l'arbre complet de traçabilité et de preuve cryptographique pour l'audit."""
-    run_id = result["run_id"]
-    source_sha256 = result["source_sha256"]
+def draw_overlay(image_path: Path, blocks: list[dict], target: Path) -> Path:
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img, "RGBA")
+    for block in blocks:
+        x1, y1, x2, y2 = block["bbox"]
+        color = (21, 120, 255, 60) if not block["security_flags"] else (230, 70, 40, 80)
+        outline = (21, 120, 255, 230) if not block["security_flags"] else (230, 70, 40, 240)
+        draw.rectangle((x1, y1, x2, y2), fill=color, outline=outline, width=3)
+        draw.text((x1 + 4, max(0, y1 - 14)), block["block_id"], fill=outline)
+    img.save(target)
+    return target
 
-    proof_tree = []
-    total_security_flags = 0
 
-    for page in result.get("pages", []):
-        page_num = page["page"]
-        page_hash = page["page_image_sha256"]
-        block_lineage = []
+def classify_block(text: str) -> str:
+    if len(text) < 80 and text.endswith(":"):
+        return "heading_or_label"
+    if re.search(r"\b(if|then|else|condition|action|class|table|foreign key)\b", text, re.I):
+        return "possible_logic_or_schema"
+    return "paragraph"
 
+
+def security_flags(text: str) -> list[str]:
+    flags = []
+    lowered = text.lower()
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, lowered, re.I):
+            flags.append("possible_prompt_injection")
+            break
+    if re.search(r"[A-Za-z0-9+/]{40,}={0,2}", text):
+        flags.append("possible_encoded_payload")
+    return flags
+
+
+def quality_flags(text: str, lines: list[OcrLine]) -> list[str]:
+    flags = []
+    avg_conf = sum(line.confidence for line in lines) / max(1, len(lines))
+    if avg_conf < 65:
+        flags.append("low_ocr_confidence")
+    if count_words(text) <= 2:
+        flags.append("too_short_for_semantic_chunk")
+    return flags
+
+
+def compare_text_layers(ocr_text: str, native_text: str) -> dict:
+    if not native_text.strip():
+        return {
+            "available": False,
+            "similarity": None,
+            "needs_human_review": False,
+            "flags": [],
+            "note": "no_native_text_layer",
+        }
+    ocr_norm = normalize_text_for_compare(ocr_text)
+    native_norm = normalize_text_for_compare(native_text)
+    similarity = round(difflib.SequenceMatcher(None, ocr_norm, native_norm).ratio(), 4)
+    flags = []
+    if similarity < 0.72:
+        flags.append("native_ocr_divergence")
+    if len(native_norm) > len(ocr_norm) * 1.35 and len(native_norm) - len(ocr_norm) > 80:
+        flags.append("native_has_extra_text")
+    if len(ocr_norm) > len(native_norm) * 1.35 and len(ocr_norm) - len(native_norm) > 80:
+        flags.append("ocr_has_extra_text")
+    return {
+        "available": True,
+        "similarity": similarity,
+        "needs_human_review": bool(flags),
+        "flags": flags,
+        "native_preview": native_text.strip()[:500],
+    }
+
+
+def detect_repeated_blocks(pages: list[dict]) -> list[dict]:
+    seen: dict[str, list[dict]] = {}
+    for page in pages:
+        for block in page["blocks"]:
+            key = normalize_text_for_compare(block["text"])
+            if len(key) < 20:
+                continue
+            seen.setdefault(key, []).append(
+                {
+                    "page": page["page"],
+                    "block_id": block["block_id"],
+                    "bbox": block["bbox"],
+                    "grid_cell": block["grid_cell"],
+                    "text": block["text"][:160],
+                }
+            )
+    repeated = []
+    for key, hits in seen.items():
+        if len(hits) >= 3:
+            repeated.append(
+                {
+                    "count": len(hits),
+                    "candidate_kind": "repeated_header_footer_or_boilerplate",
+                    "text_fingerprint": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                    "sample": hits[0]["text"],
+                    "hits": hits,
+                }
+            )
+            hit_ids = {hit["block_id"] for hit in hits}
+            for page in pages:
+                for block in page["blocks"]:
+                    if block["block_id"] in hit_ids and "repeated_boilerplate_candidate" not in block["quality_flags"]:
+                        block["quality_flags"].append("repeated_boilerplate_candidate")
+    return repeated
+
+
+def build_review_queue(pages: list[dict], chunks: list[dict], repeated: list[dict]) -> list[dict]:
+    queue = []
+    repeated_ids = {hit["block_id"] for item in repeated for hit in item["hits"]}
+    for page in pages:
+        if page.get("ocr", {}).get("status") == "empty_ocr_result":
+            queue.append(
+                {
+                    "review_id": f"{page['page_id']}-empty-ocr",
+                    "kind": "page",
+                    "page": page["page"],
+                    "reason": "ocr_engine_returned_no_text",
+                    "flags": ["empty_ocr_result"],
+                    "suggested_action": "inspect_ocr_image_or_try_binary_preprocessing_or_other_backend",
+                }
+            )
+        comparison = page["layers"]["comparison"]
+        if comparison["needs_human_review"]:
+            queue.append(
+                {
+                    "review_id": f"{page['page_id']}-layer-diff",
+                    "kind": "layer_comparison",
+                    "page": page["page"],
+                    "reason": "native_text_differs_from_visual_ocr",
+                    "flags": comparison["flags"],
+                    "suggested_action": "inspect_visual_page_before_indexing",
+                }
+            )
+        for block in page["blocks"]:
+            flags = block["security_flags"] + block["quality_flags"]
+            if not flags and block["block_id"] not in repeated_ids:
+                continue
+            queue.append(
+                {
+                    "review_id": f"{block['block_id']}-review",
+                    "kind": "block",
+                    "page": page["page"],
+                    "block_id": block["block_id"],
+                    "bbox": block["bbox"],
+                    "flags": flags,
+                    "suggested_action": "accept_or_mark_noise",
+                }
+            )
+    for chunk in chunks:
+        if chunk["security_flags"]:
+            queue.append(
+                {
+                    "review_id": f"{chunk['chunk_id']}-review",
+                    "kind": "chunk",
+                    "page": chunk["page"],
+                    "chunk_id": chunk["chunk_id"],
+                    "bbox": chunk["bbox"],
+                    "flags": chunk["security_flags"],
+                    "suggested_action": "quarantine_or_accept_after_human_review",
+                }
+            )
+    return queue
+
+
+def build_rag_records(chunks: list[dict], pages: list[dict], source_name: str, source_hash: str) -> list[dict]:
+    page_by_num = {page["page"]: page for page in pages}
+    records = []
+    document_tags = infer_document_tags("\n".join(chunk["text"] for chunk in chunks), source_name)
+    for chunk in chunks:
+        page = page_by_num.get(chunk["page"], {})
+        confidence = chunk_confidence(chunk, page)
+        index_status = "needs_review" if chunk["security_flags"] else "candidate"
+        records.append(
+            {
+                "id": f"{source_hash[:16]}:{chunk['chunk_id']}",
+                "embedding_text": contextualize_for_embedding(chunk, document_tags),
+                "raw_text": chunk["text"],
+                "index_status": index_status,
+                "tags": sorted(set(document_tags + chunk["grid_cells"] + chunk["security_flags"])),
+                "metadata": {
+                    "source_name": source_name,
+                    "source_sha256": source_hash,
+                    "page": chunk["page"],
+                    "page_sha256": chunk["page_sha256"],
+                    "chunk_id": chunk["chunk_id"],
+                    "chunk_sha256": chunk["chunk_sha256"],
+                    "text_sha256": chunk["text_sha256"],
+                    "bbox": chunk["bbox"],
+                    "grid_cells": chunk["grid_cells"],
+                    "block_ids": chunk["block_ids"],
+                    "block_hashes": chunk["block_hashes"],
+                    "ocr_confidence": confidence,
+                    "source_image_url": page.get("image_url"),
+                    "source_overlay_url": page.get("overlay_url"),
+                    "review_policy": "index_only_after_human_acceptance_when_flagged",
+                },
+            }
+        )
+    return records
+
+
+def build_graph_projection(pages: list[dict]) -> dict:
+    nodes = []
+    edges = []
+    by_label: dict[str, str] = {}
+    for page in pages:
         for block in page.get("blocks", []):
-            if block.get("security_flags"):
-                total_security_flags += len(block["security_flags"])
-            block_lineage.append({
-                "block_id": block["block_id"],
-                "block_sha256": block["block_sha256"],
-                "bbox": block["bbox"],
-                "grid_cell": block["grid_cell"],
-                "confidence": block.get("confidence"),
-                "security_flags": block.get("security_flags", []),
-            })
+            snippet = " ".join(block["text"].split())[:120]
+            node_id = block["block_id"]
+            label = normalize_relation_label(snippet)
+            nodes.append(
+                {
+                    "node_id": node_id,
+                    "page": page["page"],
+                    "bbox": block["bbox"],
+                    "grid_cell": block["grid_cell"],
+                    "kind": block["kind"],
+                    "text_preview": snippet,
+                    "source_ref": block["source_ref"],
+                }
+            )
+            if label:
+                by_label.setdefault(label, node_id)
 
-        proof_tree.append({
-            "page": page_num,
-            "page_image_sha256": page_hash,
-            "blocks": block_lineage,
-        })
+    for page in pages:
+        for block in page.get("blocks", []):
+            for source_label, relation, target_label in extract_text_relations(block["text"]):
+                source_id = by_label.get(normalize_relation_label(source_label), block["block_id"])
+                target_id = by_label.get(normalize_relation_label(target_label))
+                edges.append(
+                    {
+                        "edge_id": f"e{len(edges) + 1:03d}",
+                        "source_node_id": source_id,
+                        "target_node_id": target_id,
+                        "relation": relation,
+                        "confidence": 0.45 if target_id else 0.25,
+                        "evidence_text": f"{source_label} {relation} {target_label}",
+                        "status": "candidate_text_relation" if target_id else "unresolved_target",
+                        "page": page["page"],
+                        "bbox": block["bbox"],
+                    }
+                )
 
     return {
-        "manifest_version": "3.0",
-        "generated_at": int(time.time()),
-        "run_id": run_id,
+        "schema": "secure-ocr-lab.graph.v1",
+        "mode": "text_relation_projection",
+        "status": "candidate",
+        "nodes": nodes,
+        "edges": edges,
+        "limitations": [
+            "Visual arrow and connector detection is intentionally a V4 skeleton.",
+            "Use OpenCV or a vision-language model before trusting visual graph edges.",
+        ],
+    }
+
+
+def extract_text_relations(text: str) -> list[tuple[str, str, str]]:
+    relations = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        match = re.search(r"(.{1,60}?)(->|=>)(.{1,60})", line)
+        if match:
+            relations.append((match.group(1).strip(), match.group(2), match.group(3).strip()))
+            continue
+        match = re.search(r"\bif\s+(.{1,80}?)\s+then\s+(.{1,80})", line, re.I)
+        if match:
+            relations.append((match.group(1).strip(), "if_then", match.group(2).strip()))
+    return relations
+
+
+def normalize_relation_label(value: str) -> str:
+    value = normalize_text_for_compare(value)
+    words = value.split()
+    return " ".join(words[:8])
+
+
+def build_audit_manifest(result: dict) -> dict:
+    review_queue = result.get("quality_report", {}).get("review_queue", [])
+    return {
+        "schema": "secure-ocr-lab.audit.v1",
+        "analysis_schema_version": result.get("schema_version"),
+        "pipeline_version": result.get("pipeline_version"),
+        "run_id": result["run_id"],
         "source_name": result["source_name"],
-        "source_sha256": source_sha256,
+        "source_sha256": result["source_sha256"],
         "ocr_lang": result["ocr_lang"],
         "dpi": result["dpi"],
-        "audit_summary": {
-            "page_count": result["page_count"],
-            "block_count": sum(len(p.get("blocks", [])) for p in result.get("pages", [])),
-            "chunk_count": len(result.get("chunks", [])),
-            "flagged_issues_count": total_security_flags,
-            "audit_compliance": "pass" if total_security_flags == 0 else "requires_human_review",
+        "raster_policy": result["ingestion_manifest"]["raster_policy"],
+        "native_text_policy": result["ingestion_manifest"]["native_text_policy"],
+        "page_hashes": result["ingestion_manifest"]["page_hashes"],
+        "chunk_hashes": result["ingestion_manifest"]["chunk_hashes"],
+        "preprocessing": [
+            {
+                "page": page["page"],
+                "mode": page["preprocessing"]["mode"],
+                "steps": page["preprocessing"]["steps"],
+                "ocr_image_sha256": page["ocr_image_sha256"],
+            }
+            for page in result.get("pages", [])
+        ],
+        "review_required_count": len(review_queue),
+        "rag_record_count": len(result.get("rag_records", [])),
+        "graph_node_count": len(result.get("graph", {}).get("nodes", [])),
+        "graph_edge_count": len(result.get("graph", {}).get("edges", [])),
+        "evidence_model": {
+            "parent": "source_sha256",
+            "children": ["page_image_sha256", "block_sha256", "chunk_sha256"],
+            "lookup_keys": ["run_id", "page", "bbox", "chunk_id", "block_ids"],
         },
-        "proof_tree": proof_tree,
     }
+
+
+def contextualize_for_embedding(chunk: dict, document_tags: list[str]) -> str:
+    context = [
+        f"Document tags: {', '.join(document_tags) if document_tags else 'unknown'}",
+        f"Source: {chunk['source_name']}",
+        f"Page: {chunk['page']}",
+        f"Grid: {', '.join(chunk['grid_cells'])}",
+        "",
+        chunk["text"],
+    ]
+    return "\n".join(context).strip()
+
+
+def infer_document_tags(text: str, source_name: str) -> list[str]:
+    haystack = f"{source_name}\n{text}".lower()
+    tags = []
+    if re.search(r"\b(receipt|ticket|total|tva|vat|cash|cb|euros?|€)\b", haystack):
+        tags.append("document:receipt")
+    if re.search(r"\b(invoice|facture|amount due|siret|iban)\b", haystack):
+        tags.append("document:invoice")
+    if re.search(r"\b(class|table|foreign key|primary key|schema|database)\b", haystack):
+        tags.append("document:schema_or_database")
+    if re.search(r"\b(condition|action|workflow|task|step|then|else)\b", haystack):
+        tags.append("document:workflow_or_logic")
+    if not tags:
+        tags.append("document:unknown")
+    return tags
+
+
+def chunk_confidence(chunk: dict, page: dict) -> float | None:
+    block_ids = set(chunk["block_ids"])
+    values = [
+        block["confidence"]
+        for block in page.get("blocks", [])
+        if block["block_id"] in block_ids and isinstance(block.get("confidence"), (int, float))
+    ]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def normalize_text_for_compare(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\w\s.,:;!?€$%-]", "", text, flags=re.UNICODE)
+    return text.strip()
+
+
+def grid_cell(bbox: tuple[int, int, int, int], cols: int = 8, rows: int = 8) -> str:
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    col = min(cols, max(1, int(cx / 1400 * cols) + 1))
+    row = min(rows, max(1, int(cy / 2000 * rows) + 1))
+    return f"R{row}C{col}"
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
+def union_bbox(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def horizontal_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    overlap = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    width = max(1, min(a[2] - a[0], b[2] - b[0]))
+    return overlap / width

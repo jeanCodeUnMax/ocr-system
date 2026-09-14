@@ -6,14 +6,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ocr_pipeline import analyze_document, analyze_plain_text, build_audit_manifest, make_run_id
+from ocr_pipeline import (
+    OCR_PREPROCESS_MODE,
+    analyze_document,
+    analyze_plain_text,
+    build_audit_manifest,
+    make_run_id,
+    tesseract_diagnostics,
+)
 from storage import get_review_decisions, init_db, persist_analysis, set_review_decision
+
 
 ROOT = Path(__file__).resolve().parent
 RUNS = ROOT / "runs"
 STATIC = ROOT / "static"
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("PORT", "8788"))
+PORT = int(os.environ.get("PORT", "8765"))
 
 
 def parse_multipart(body: bytes, content_type: str) -> dict[str, tuple[str, bytes] | str]:
@@ -55,7 +63,15 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path in {"/health", "/api/health"}:
             self.send_json({"ok": True, "service": "secure-ocr-lab"})
         elif parsed.path == "/api/config":
-            self.send_json({"ok": True, "ocr_lang": os.environ.get("OCR_LANG", "eng"), "port": PORT})
+            self.send_json(
+                {
+                    "ok": True,
+                    "ocr_lang": os.environ.get("OCR_LANG", "eng"),
+                    "ocr_preprocess_mode": OCR_PREPROCESS_MODE,
+                    "tesseract": tesseract_diagnostics(),
+                    "port": PORT,
+                }
+            )
         elif parsed.path == "/api/rag-export":
             self.handle_rag_export(parsed.query)
         else:
@@ -74,6 +90,7 @@ class Handler(BaseHTTPRequestHandler):
         run_id = make_run_id()
         run_dir = RUNS / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+
         try:
             if content_type.startswith("multipart/form-data"):
                 fields = parse_multipart(body, content_type)
@@ -95,9 +112,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Texte vide.")
                 result = analyze_plain_text(text, run_dir)
 
-            (run_dir / "analysis.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            (run_dir / "analysis.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             audit_manifest = build_audit_manifest(result)
-            (run_dir / "audit_manifest.json").write_text(json.dumps(audit_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (run_dir / "audit_manifest.json").write_text(
+                json.dumps(audit_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             with (run_dir / "rag_records.jsonl").open("w", encoding="utf-8") as handle:
                 for record in result.get("rag_records", []):
                     handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
@@ -184,9 +205,12 @@ def apply_review_policy(records: list[dict], decisions: dict[str, dict], policy:
         block_ids = metadata.get("block_ids", [])
         chunk_decision = decisions.get(f"chunk:{chunk_id}", {}).get("decision")
         block_decisions = [decisions.get(f"block:{block_id}", {}).get("decision") for block_id in block_ids]
-        blocked = chunk_decision in {"noise", "quarantine", "needs_reocr"} or any(item in {"noise", "quarantine", "needs_reocr"} for item in block_decisions)
+        blocked = chunk_decision in {"noise", "quarantine", "needs_reocr"} or any(
+            item in {"noise", "quarantine", "needs_reocr"} for item in block_decisions
+        )
         needs_review = record.get("index_status") == "needs_review"
         accepted = chunk_decision == "accepted" or any(item == "accepted" for item in block_decisions)
+
         if policy == "reviewed":
             if blocked:
                 continue
@@ -195,6 +219,7 @@ def apply_review_policy(records: list[dict], decisions: dict[str, dict], policy:
         elif policy == "accepted":
             if not accepted or blocked:
                 continue
+
         patched = dict(record)
         patched["review_decision"] = chunk_decision or "implicit_candidate"
         patched["export_policy"] = policy

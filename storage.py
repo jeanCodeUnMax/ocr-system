@@ -6,10 +6,11 @@ import sqlite3
 import time
 from pathlib import Path
 
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = ROOT / "secure_ocr_lab.sqlite3"
 VALID_DECISIONS = {"pending", "accepted", "noise", "quarantine", "needs_reocr"}
-VALID_TARGETS = {"block", "chunk", "layer_comparison", "document"}
+VALID_TARGETS = {"page", "block", "chunk", "layer_comparison", "document"}
 
 
 def get_db_path(db_path: Path | None = None) -> Path:
@@ -43,6 +44,7 @@ def init_db(db_path: Path | None = None) -> None:
                 analysis_json TEXT NOT NULL,
                 audit_manifest_json TEXT
             );
+
             CREATE TABLE IF NOT EXISTS pages (
                 run_id TEXT NOT NULL,
                 page INTEGER NOT NULL,
@@ -54,6 +56,7 @@ def init_db(db_path: Path | None = None) -> None:
                 PRIMARY KEY (run_id, page),
                 FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
             );
+
             CREATE TABLE IF NOT EXISTS blocks (
                 run_id TEXT NOT NULL,
                 block_id TEXT NOT NULL,
@@ -69,6 +72,7 @@ def init_db(db_path: Path | None = None) -> None:
                 PRIMARY KEY (run_id, block_id),
                 FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
             );
+
             CREATE TABLE IF NOT EXISTS chunks (
                 run_id TEXT NOT NULL,
                 chunk_id TEXT NOT NULL,
@@ -83,6 +87,7 @@ def init_db(db_path: Path | None = None) -> None:
                 PRIMARY KEY (run_id, chunk_id),
                 FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
             );
+
             CREATE TABLE IF NOT EXISTS review_decisions (
                 run_id TEXT NOT NULL,
                 target_kind TEXT NOT NULL,
@@ -127,7 +132,15 @@ def persist_analysis(result: dict, audit_manifest: dict | None = None, db_path: 
                 (run_id, page, page_image_sha256, width, height, image_url, overlay_url)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, page["page"], page["page_image_sha256"], page["width"], page["height"], page.get("image_url"), page.get("overlay_url")),
+                (
+                    run_id,
+                    page["page"],
+                    page["page_image_sha256"],
+                    page["width"],
+                    page["height"],
+                    page.get("image_url"),
+                    page.get("overlay_url"),
+                ),
             )
             for block in page.get("blocks", []):
                 conn.execute(
@@ -174,7 +187,14 @@ def persist_analysis(result: dict, audit_manifest: dict | None = None, db_path: 
             )
 
 
-def set_review_decision(run_id: str, target_kind: str, target_id: str, decision: str, note: str = "", db_path: Path | None = None) -> dict:
+def set_review_decision(
+    run_id: str,
+    target_kind: str,
+    target_id: str,
+    decision: str,
+    note: str = "",
+    db_path: Path | None = None,
+) -> dict:
     if target_kind not in VALID_TARGETS:
         raise ValueError(f"target_kind invalide: {target_kind}")
     if decision not in VALID_DECISIONS:
@@ -194,14 +214,25 @@ def set_review_decision(run_id: str, target_kind: str, target_id: str, decision:
             """,
             (run_id, target_kind, target_id, decision, note, updated_at),
         )
-    return {"run_id": run_id, "target_kind": target_kind, "target_id": target_id, "decision": decision, "note": note, "updated_at": updated_at}
+    return {
+        "run_id": run_id,
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "decision": decision,
+        "note": note,
+        "updated_at": updated_at,
+    }
 
 
 def get_review_decisions(run_id: str, db_path: Path | None = None) -> dict[str, dict]:
     init_db(db_path)
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT target_kind, target_id, decision, note, updated_at FROM review_decisions WHERE run_id = ?",
+            """
+            SELECT target_kind, target_id, decision, note, updated_at
+            FROM review_decisions
+            WHERE run_id = ?
+            """,
             (run_id,),
         ).fetchall()
     return {f"{row['target_kind']}:{row['target_id']}": dict(row) for row in rows}
