@@ -188,7 +188,17 @@
           <span class="tag">OCR ${first.ocr.engine}</span>
           <span class="tag">lang ${first.ocr.effective_lang}</span>
           ${(first.ocr.missing_langs || []).map(lang => `<span class="tag quality">langue absente ${lang}</span>`).join("")}
-          <span class="tag ${first.ocr.status === "empty_ocr_result" ? "quality" : ""}">${first.ocr.status}</span>
+          <span class="tag ${first.ocr.status === "ok" ? "" : "quality"}">${first.ocr.status}</span>
+          <span class="tag">confiance ${first.ocr.avg_confidence ?? "n/a"}</span>
+          <span class="tag">score ${first.ocr.score ?? "n/a"}</span>
+        </div>
+        <div class="review">
+          <span class="tag">passe retenue ${first.ocr.selected_mode || first.preprocessing.mode}</span>
+          ${(first.ocr.attempts || []).map(attempt => `
+            <span class="tag ${attempt.status === "ok" ? "" : "quality"}">
+              ${attempt.mode}: ${attempt.status}, conf ${attempt.avg_confidence ?? "n/a"}, mots ${attempt.word_count}
+            </span>
+          `).join("")}
         </div>
       `;
       const queue = data.quality_report.review_queue;

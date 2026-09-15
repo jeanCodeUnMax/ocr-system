@@ -7,6 +7,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ocr_pipeline import (
+    OCR_MAX_PASSES,
+    OCR_MIN_CONFIDENCE,
     OCR_PREPROCESS_MODE,
     analyze_document,
     analyze_plain_text,
@@ -68,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "ocr_lang": os.environ.get("OCR_LANG", "eng"),
                     "ocr_preprocess_mode": OCR_PREPROCESS_MODE,
+                    "ocr_max_passes": OCR_MAX_PASSES,
+                    "ocr_min_confidence": OCR_MIN_CONFIDENCE,
                     "tesseract": tesseract_diagnostics(),
                     "port": PORT,
                 }

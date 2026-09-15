@@ -24,6 +24,9 @@ def test_plain_text_smoke(tmp_path: Path) -> None:
     assert result["pages"][0]["preprocessing"]["bbox_preserved"] is True
     assert result["pages"][0]["ocr"]["engine"] == "tesseract_cli"
     assert result["pages"][0]["ocr"]["effective_lang"]
+    assert result["ocr_strategy"]["max_passes"] >= 1
+    assert result["pages"][0]["ocr"]["attempts"]
+    assert result["pages"][0]["ocr"]["selected_mode"]
     assert result["ocr_diagnostics"]["available"] is True
     assert result["chunks"][0]["chunk_sha256"]
     assert result["chunks"][0]["evidence_chain"]["source_sha256"] == result["source_sha256"]
@@ -73,6 +76,7 @@ def test_pdf_all_pages_smoke(tmp_path: Path) -> None:
     assert len(result["pages"]) == 2
     assert all(page["ocr_image_sha256"] for page in result["pages"])
     assert all(page["preprocessing"]["bbox_preserved"] is True for page in result["pages"])
+    assert all(page["ocr"]["attempts"] for page in result["pages"])
 
 
 if __name__ == "__main__":

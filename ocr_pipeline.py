@@ -26,6 +26,8 @@ PIPELINE_VERSION = "0.5.1"
 SCHEMA_VERSION = "secure-ocr-lab.analysis.v2"
 OCR_PREPROCESS_MODE = os.environ.get("OCR_PREPROCESS_MODE", "auto")
 BINARY_THRESHOLD = int(os.environ.get("OCR_BINARY_THRESHOLD", "180"))
+OCR_MIN_CONFIDENCE = float(os.environ.get("OCR_MIN_CONFIDENCE", "65"))
+OCR_MAX_PASSES = int(os.environ.get("OCR_MAX_PASSES", "4"))
 
 INJECTION_PATTERNS = [
     r"ignore\s+(all\s+)?previous\s*instructions?",
@@ -159,8 +161,11 @@ def analyze_images(
     for page_num, image_path in enumerate(images, start=1):
         page_id = f"p{page_num:03d}"
         page_hash = sha256_file(image_path)
-        ocr_image_path, preprocessing = prepare_image_for_ocr(image_path, run_dir / f"page-{page_num:03d}-ocr.png")
-        lines, ocr_report = run_tesseract(ocr_image_path)
+        ocr_attempt = run_best_ocr_attempt(image_path, run_dir, page_num)
+        ocr_image_path = ocr_attempt["image_path"]
+        preprocessing = ocr_attempt["preprocessing"]
+        lines = ocr_attempt["lines"]
+        ocr_report = ocr_attempt["ocr"]
         blocks = group_lines_into_blocks(lines, page_id, page_hash, source_hash)
         page_text = "\n".join(block["text"] for block in blocks)
         native_text = native_pages[page_num - 1] if page_num - 1 < len(native_pages) else ""
@@ -223,6 +228,12 @@ def analyze_images(
         "dpi": DPI,
         "ocr_engine": "tesseract_cli",
         "ocr_diagnostics": tesseract_diagnostics(),
+        "ocr_strategy": {
+            "mode": OCR_PREPROCESS_MODE,
+            "max_passes": OCR_MAX_PASSES,
+            "min_confidence": OCR_MIN_CONFIDENCE,
+            "rule": "try image variants, score OCR output, keep best auditable image",
+        },
         "ingestion_manifest": {
             "schema": "secure-ocr-lab.ingestion.v1",
             "source_name": source_name,
@@ -255,8 +266,86 @@ def analyze_images(
     }
 
 
-def prepare_image_for_ocr(source: Path, target: Path) -> tuple[Path, dict]:
+def run_best_ocr_attempt(source: Path, run_dir: Path, page_num: int) -> dict:
+    attempts = []
+    candidates = prepare_ocr_candidates(source, run_dir, page_num)
+    for candidate in candidates[: max(1, OCR_MAX_PASSES)]:
+        try:
+            lines, report = run_tesseract(candidate["path"])
+        except Exception as exc:
+            lines = []
+            report = {
+                "engine": "tesseract_cli",
+                "requested_lang": OCR_LANG_REQUESTED,
+                "effective_lang": None,
+                "missing_langs": [],
+                "available_langs": [],
+                "returncode": 1,
+                "stderr": str(exc)[:1000],
+                "word_count": 0,
+                "line_count": 0,
+                "status": "ocr_error",
+            }
+        report["score"] = score_ocr_lines(lines)
+        report["avg_confidence"] = average_confidence(lines)
+        report["preprocessing_mode"] = candidate["preprocessing"]["mode"]
+        attempts.append(
+            {
+                "image_path": candidate["path"],
+                "preprocessing": candidate["preprocessing"],
+                "lines": lines,
+                "ocr": report,
+            }
+        )
+        if report["status"] == "ok" and report["avg_confidence"] >= OCR_MIN_CONFIDENCE and report["word_count"] >= 8:
+            break
+
+    best = max(attempts, key=lambda item: item["ocr"]["score"])
+    best["ocr"]["attempts"] = [
+        {
+            "mode": item["preprocessing"]["mode"],
+            "steps": item["preprocessing"]["steps"],
+            "image_sha256": item["preprocessing"].get("ocr_image_sha256"),
+            "status": item["ocr"]["status"],
+            "word_count": item["ocr"].get("word_count", 0),
+            "line_count": item["ocr"].get("line_count", 0),
+            "avg_confidence": item["ocr"].get("avg_confidence"),
+            "score": item["ocr"].get("score"),
+        }
+        for item in attempts
+    ]
+    best["ocr"]["selected_mode"] = best["preprocessing"]["mode"]
+    if best["ocr"].get("status") == "ocr_error":
+        best["ocr"]["status"] = "ocr_error"
+    elif best["ocr"]["word_count"] == 0:
+        best["ocr"]["status"] = "empty_ocr_result"
+    elif best["ocr"]["avg_confidence"] < OCR_MIN_CONFIDENCE:
+        best["ocr"]["status"] = "low_confidence"
+    else:
+        best["ocr"]["status"] = "ok"
+    return best
+
+
+def prepare_ocr_candidates(source: Path, run_dir: Path, page_num: int) -> list[dict]:
     mode = OCR_PREPROCESS_MODE.lower().strip()
+    canonical = run_dir / f"page-{page_num:03d}-ocr.png"
+    if mode in {"off", "none", "raw", "binary", "threshold", "auto_light", "sharp"}:
+        path, preprocessing = prepare_image_for_ocr(source, canonical, mode)
+        return [{"path": path, "preprocessing": preprocessing}]
+
+    specs = [
+        ("auto", canonical),
+        ("binary", run_dir / f"page-{page_num:03d}-ocr-binary.png"),
+        ("auto_light", run_dir / f"page-{page_num:03d}-ocr-light.png"),
+        ("sharp", run_dir / f"page-{page_num:03d}-ocr-sharp.png"),
+    ]
+    return [{"path": path, "preprocessing": preprocessing} for path, preprocessing in (
+        prepare_image_for_ocr(source, target, item_mode) for item_mode, target in specs
+    )]
+
+
+def prepare_image_for_ocr(source: Path, target: Path, requested_mode: str | None = None) -> tuple[Path, dict]:
+    mode = (requested_mode or OCR_PREPROCESS_MODE).lower().strip()
     if mode in {"off", "none", "raw"}:
         Image.open(source).convert("RGB").save(target)
         return target, {
@@ -269,12 +358,20 @@ def prepare_image_for_ocr(source: Path, target: Path) -> tuple[Path, dict]:
     original = Image.open(source).convert("RGB")
     prepared = ImageOps.grayscale(original)
     prepared = ImageOps.autocontrast(prepared)
-    prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
-    prepared = prepared.filter(ImageFilter.UnsharpMask(radius=1.4, percent=155, threshold=3))
-    steps = ["grayscale", "autocontrast", "median_filter_3", "unsharp_mask"]
+    steps = ["grayscale", "autocontrast"]
+
+    if mode != "auto_light":
+        prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
+        steps.append("median_filter_3")
+
+    if mode in {"sharp", "auto"}:
+        prepared = prepared.filter(ImageFilter.UnsharpMask(radius=1.4, percent=155, threshold=3))
+        steps.append("unsharp_mask")
 
     if mode in {"binary", "threshold"}:
+        prepared = prepared.filter(ImageFilter.UnsharpMask(radius=1.2, percent=130, threshold=3))
         prepared = prepared.point(lambda pixel: 255 if pixel >= BINARY_THRESHOLD else 0, mode="1").convert("L")
+        steps.append("unsharp_mask")
         steps.append(f"binary_threshold_{BINARY_THRESHOLD}")
 
     prepared.convert("RGB").save(target)
@@ -286,6 +383,22 @@ def prepare_image_for_ocr(source: Path, target: Path) -> tuple[Path, dict]:
         "ocr_image_sha256": sha256_file(target),
         "note": "same pixel dimensions as source page, so OCR bbox can be projected on the displayed page",
     }
+
+
+def average_confidence(lines: list[OcrLine]) -> float:
+    if not lines:
+        return 0.0
+    return round(sum(line.confidence for line in lines) / len(lines), 2)
+
+
+def score_ocr_lines(lines: list[OcrLine]) -> float:
+    if not lines:
+        return 0.0
+    text = " ".join(line.text for line in lines)
+    word_count = count_words(text)
+    char_count = len(re.sub(r"\s+", "", text))
+    avg_conf = average_confidence(lines)
+    return round(avg_conf * 1.5 + min(word_count, 250) * 2 + min(char_count, 2000) * 0.05, 2)
 
 
 def run_tesseract(image_path: Path) -> tuple[list[OcrLine], dict]:
@@ -650,15 +763,21 @@ def build_review_queue(pages: list[dict], chunks: list[dict], repeated: list[dic
     queue = []
     repeated_ids = {hit["block_id"] for item in repeated for hit in item["hits"]}
     for page in pages:
-        if page.get("ocr", {}).get("status") == "empty_ocr_result":
+        ocr_status = page.get("ocr", {}).get("status")
+        if ocr_status in {"empty_ocr_result", "low_confidence", "ocr_error"}:
+            reason_by_status = {
+                "empty_ocr_result": "ocr_engine_returned_no_text",
+                "low_confidence": "ocr_engine_low_confidence_after_image_retries",
+                "ocr_error": "ocr_engine_failed",
+            }
             queue.append(
                 {
-                    "review_id": f"{page['page_id']}-empty-ocr",
+                    "review_id": f"{page['page_id']}-{ocr_status}",
                     "kind": "page",
                     "page": page["page"],
-                    "reason": "ocr_engine_returned_no_text",
-                    "flags": ["empty_ocr_result"],
-                    "suggested_action": "inspect_ocr_image_or_try_binary_preprocessing_or_other_backend",
+                    "reason": reason_by_status[ocr_status],
+                    "flags": [ocr_status],
+                    "suggested_action": "inspect_ocr_attempts_or_try_other_backend",
                 }
             )
         comparison = page["layers"]["comparison"]
